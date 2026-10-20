@@ -1,31 +1,47 @@
 {
-  "checkedAt": "2026-10-20T21:11:15.422Z",
+  "checkedAt": "2026-10-20T21:37:32.354Z",
   "results": [
     {
       "target": "development server",
-      "combinations": 96,
-      "demoControls": "passed",
-      "fallCancelAndTimeout": "passed",
-      "navigation": "passed",
+      "readinessCombinations": 96,
+      "acceptanceScenarios": 8,
+      "phoneActionGuard": "passed",
+      "deliveryAndHapticStates": "passed",
+      "fallCancelRepeatAndReload": "passed",
+      "contactManagement": "passed",
+      "historyFilters": "passed",
+      "syntheticAudioPlaybackAndDownload": "passed",
+      "componentFailures": "passed",
+      "greeting": "passed",
       "responsiveWidths": [
         1440,
+        768,
         390,
         320
       ],
-      "runtimeErrors": []
+      "runtimeErrors": [],
+      "externalRequests": []
     },
     {
       "target": "standalone over HTTP",
-      "combinations": 96,
-      "demoControls": "passed",
-      "fallCancelAndTimeout": "passed",
-      "navigation": "passed",
+      "readinessCombinations": 96,
+      "acceptanceScenarios": 8,
+      "phoneActionGuard": "passed",
+      "deliveryAndHapticStates": "passed",
+      "fallCancelRepeatAndReload": "passed",
+      "contactManagement": "passed",
+      "historyFilters": "passed",
+      "syntheticAudioPlaybackAndDownload": "passed",
+      "componentFailures": "passed",
+      "greeting": "passed",
       "responsiveWidths": [
         1440,
+        768,
         390,
         320
       ],
-      "runtimeErrors": []
+      "runtimeErrors": [],
+      "externalRequests": []
     }
   ]
 }

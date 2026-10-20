@@ -42,222 +42,378 @@ const ICONS = {
 const icon = (name, cls='') => `<svg class="icon ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ICONS.info}</svg>`;
 const esc = value => String(value ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const initials = name => name.trim().split(/\s+/).slice(0,2).map(x=>x[0]||'').join('').toUpperCase();
-const STORAGE = 'ccew-companion-ui-v1';
-const seedTime = (h,m,days=0) => { const d=new Date();d.setDate(d.getDate()-days);d.setHours(h,m,0,0);return d.getTime(); };
-const freshState = () => ({
- version:1, connected:true, worn:true, battery:84, charging:false, lastSync:Date.now(),
- profile:{name:'Alex Morgan', role:'Community responder', organization:'Community response team'},
- settings:{disconnectNotice:true, contactNotice:true, reducedMotion:false, hapticPattern:'Two short pulses'},
- contacts:[
-  {id:'jordan',name:'Jordan Lee',role:'Team supervisor',phone:'(555) 010-0248',email:'jordan@example.com'},
-  {id:'taylor',name:'Taylor Brooks',role:'Safety representative',phone:'(555) 010-0163',email:'taylor@example.com'}
- ],
- events:[
-  {id:'sample-check',type:'test',created:seedTime(8,52),status:'acknowledged',received:seedTime(8,52),acknowledged:seedTime(8,53),ackBy:'Jordan Lee',audioReadyAt:seedTime(8,52)+20000,audioSynced:true,hapticPending:false},
-  {id:'sample-fall',type:'fall',created:seedTime(15,24,1),status:'acknowledged',received:seedTime(15,24,1),acknowledged:seedTime(15,25,1),ackBy:'Taylor Brooks',audioReadyAt:seedTime(15,24,1)+20000,audioSynced:true,hapticPending:false}
- ], deviceOutbox:[],fallDue:null
-});
-let state;
-try {
- const saved=JSON.parse(localStorage.getItem(STORAGE));
- state=saved?.version===1&&Array.isArray(saved.contacts)&&Array.isArray(saved.events)&&saved.settings&&saved.profile&&Array.isArray(saved.deviceOutbox)?saved:freshState();
-} catch { state=freshState(); }
+
+// Composition root: views call services instead of changing wearable telemetry.
+const { Store, BleService, DeviceService, AlertService, HapticService, AudioService, DemoWearable } = CCEW;
+let browserStorage;
+try { browserStorage = localStorage; } catch { /* Private/file contexts can deny storage. */ }
+const store = new Store({ storage: browserStorage });
+const ble = new BleService(store);
+const device = new DeviceService(store, ble);
+const alerts = new AlertService(store, ble);
+const haptics = new HapticService(store, ble, alerts);
+const audio = new AudioService(store, ble);
+const demo = new DemoWearable(store, ble, device, alerts, haptics);
+const app = { store, ble, device, alerts, haptics, audio, demo };
+window.CCEWApp = app;
+const NAV = [['overview','home','Overview'],['device','watch','My device'],['alerts','bell','Alerts'],['contacts','users','Contacts'],['settings','settings','Settings']];
+const TYPES = { manual: { title: 'Manual alert', icon: 'alert' }, fall: { title: 'Fall detected', icon: 'activity' }, removal: { title: 'Device removal detected', icon: 'contact' }, test: { title: 'Device check completed', icon: 'checkcircle' } };
+const STATUS = { detected: 'Detected on wearable', transferring: 'Transferring to phone', received: 'Received by phone', delivered: 'Delivered to safety contacts', acknowledged: 'Acknowledged', 'delivery-failed': 'Contact delivery failed' };
+const HAPTIC = { 'not-requested': 'Not requested', pending: 'Pending connection', sent: 'Command sent · awaiting confirmation', successful: 'Wearable confirmed completion', failed: 'Feedback failed' };
 let view = location.hash.slice(1) || 'overview';
-let filter='all', toastTimer, playingAudio=null, audioURL=null, activeEvent=null;
-const modal=document.querySelector('#modal');
-const TYPES={manual:{title:'Alarm button pressed',icon:'alert',short:'Manual alert'},fall:{title:'Fall detected',icon:'activity',short:'Fall alert'},removal:{title:'Device removal detected',icon:'contact',short:'Removal alert'},test:{title:'Device check completed',icon:'checkcircle',short:'Test alert'}};
-const NAV=[['overview','home','Overview'],['device','watch','My device'],['alerts','bell','Alerts'],['contacts','users','Contacts'],['settings','settings','Settings']];
-const pendingCount=()=>state.events.filter(e=>e.status==='awaiting').length;
-function save(){try{localStorage.setItem(STORAGE,JSON.stringify(state));}catch{toast('Browser storage is unavailable. Changes will last for this session.');}}
-function announce(text){document.querySelector('#live-updates').textContent=text;}
-function toast(text,error=false){const t=document.querySelector('#toast');t.textContent=text;t.classList.add('visible');t.classList.toggle('error',error);clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('visible'),4200);announce(text);}
-const time = stamp => new Date(stamp).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
-const date = stamp => new Date(stamp).toLocaleDateString('en-US',{month:'short',day:'numeric'});
-const statusPill=e=>e.status==='acknowledged'?'<span class="pill">Acknowledged</span>':e.status==='cancelled'?'<span class="pill neutral">Cancelled</span>':'<span class="pill pending">Awaiting reply</span>';
-const wave=()=>`<div class="waveform" aria-hidden="true">${Array.from({length:44},(_,i)=>`<span style="height:${8+Math.round(Math.abs(Math.sin(i*2.17)*Math.sin(i*.43))*28)}px"></span>`).join('')}</div>`;
-function hydrateIcons(root=document){root.querySelectorAll('[data-icon]').forEach(el=>{el.innerHTML=icon(el.dataset.icon);el.removeAttribute('data-icon');});}
-
-function navTo(target){if(target===view){render();return;}history.pushState(null,'','#'+target);view=target;closeModal();render();document.querySelector('#main').focus({preventScroll:true});window.scrollTo(0,0);}
-window.addEventListener('hashchange',()=>{view=location.hash.slice(1)||'overview';closeModal();render();document.querySelector('#main').focus({preventScroll:true});window.scrollTo(0,0);});
-function header(title,subtitle,eyebrow='YOUR COMPANION',action=''){
- return `<div class="page-header"><div><p class="eyebrow">${eyebrow}</p><h1>${title}</h1><p class="page-subtitle">${subtitle}</p></div><div class="header-actions">${action}<span class="demo-pill">DEMO DATA</span><button class="icon-button" data-view="alerts" aria-label="View alerts">${icon('bell')}</button><button class="header-avatar" data-view="settings" aria-label="Edit your profile">${esc(initials(state.profile.name))}</button></div></div>`;
+let statusFilter = 'all', typeFilter = 'all', activeEvent = null, toastTimer, needsRender = false, clockLabel = '';
+const modal = document.querySelector('#modal');
+const time = stamp => new Date(stamp).toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+const exactTime = stamp => stamp === null ? 'Pending' : new Date(stamp).toLocaleString('en-US', { year:'numeric', month:'short', day:'numeric', hour:'numeric', minute:'2-digit', second:'2-digit', timeZoneName:'short' });
+const stamp = value => value === null ? '<span>Pending</span>' : `<time datetime="${new Date(value).toISOString()}">${esc(exactTime(value))}</time>`;
+const pendingCount = () => alerts.visible().filter(e => e.acknowledgedAt === null).length;
+const greeting = (date = new Date()) => date.getHours() < 12 ? 'Good morning' : date.getHours() < 18 ? 'Good afternoon' : 'Good evening';
+function deviceReadiness() { return device.readiness({ transferring: alerts.queued().length > 0 && ble.isReady() }); }
+const wave = () => `<div class="waveform" aria-hidden="true">${Array.from({length:44}, (_,i) => `<span style="height:${8 + Math.round(Math.abs(Math.sin(i*2.17)*Math.sin(i*.43))*28)}px"></span>`).join('')}</div>`;
+const pill = (text, mode = '') => `<span class="pill ${mode}">${esc(text)}</span>`;
+const statusPill = event => pill(STATUS[alerts.status(event)], event.acknowledgedAt !== null ? '' : 'pending');
+function hydrateIcons(root = document) { root.querySelectorAll('[data-icon]').forEach(el => { el.innerHTML = icon(el.dataset.icon); el.removeAttribute('data-icon'); }); }
+function announce(text) { document.querySelector('#live-updates').textContent = text; }
+function toast(text, error = false) {
+  const node = document.querySelector('#toast'); node.textContent = text;
+  node.classList.add('visible'); node.classList.toggle('error',error);
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => node.classList.remove('visible'),4200); announce(text);
 }
-function notices(){let html='';
- if(!state.connected)html+=`<div class="notice error">${icon('offline')}<span class="notice-copy"><strong>Wearable out of range.</strong> Device status is last known. Events stored on the wearable will sync when it reconnects.</span><button class="button" data-action="reconnect">Reconnect</button></div>`;
- if(state.connected&&!state.worn)html+=`<div class="notice">${icon('contact')}<span class="notice-copy"><strong>Check the fit of your wearable.</strong> Skin contact is not detected.</span><button class="button" data-view="device">View device</button></div>`;
- if(state.battery<=20)html+=`<div class="notice">${icon('battery')}<span class="notice-copy"><strong>${state.connected?'Battery is low':'Last known battery was low'} (${state.battery}%).</strong> ${state.connected?'Connect the wearable to a USB-C charger.':'Reconnect to update the battery status.'}</span></div>`;
- if(state.fallDue)html+=`<div class="notice error">${icon('activity')}<span class="notice-copy"><strong>Possible fall detected.</strong> A demo alert will be created in <span data-fall-count>${Math.max(0,Math.ceil((state.fallDue-Date.now())/1000))}</span>s.</span><button class="button" data-action="cancel-fall">I'm okay</button></div>`;
- return html;
+function navTo(target) {
+  view = NAV.some(n => n[0] === target) ? target : 'overview';
+  if (location.hash !== '#' + view) history.pushState(null,'','#' + view);
+  closeModal(); render(); document.querySelector('#main').focus({preventScroll:true}); window.scrollTo(0,0);
 }
-function render(){
- if(!NAV.some(n=>n[0]===view))view='overview';
- document.body.classList.toggle('reduced-motion',state.settings.reducedMotion);
- document.title=`${NAV.find(n=>n[0]===view)[2]} · CCEW Companion`;
- document.querySelector('#desktop-nav').innerHTML=NAV.map(([id,i,name])=>`<a class="nav-link ${view===id?'active':''}" ${view===id?'aria-current="page"':''} href="#${id}">${icon(i)}<span class="nav-label">${name}</span>${id==='alerts'&&pendingCount()?`<span class="nav-number">${pendingCount()}</span>`:''}</a>`).join('');
- document.querySelector('#mobile-nav').innerHTML=NAV.map(([id,i,name])=>`<a class="${view===id?'active':''}" ${view===id?'aria-current="page"':''} href="#${id}">${icon(i)}<span>${name==='My device'?'Device':name}</span></a>`).join('');
- document.querySelector('#sidebar-connection').innerHTML=`<span class="small-dot" style="${!state.connected?'background:#bb967b':''}"></span><span><strong>${state.connected?'Wearable connected':'Wearable disconnected'}</strong><small>CCEW-024 · ${state.battery}% battery${!state.connected?' (last seen)':''}</small></span>`;
- document.querySelector('#main').innerHTML=({overview:overviewPage,device:devicePage,alerts:alertsPage,contacts:contactsPage,settings:settingsPage}[view])();
- hydrateIcons();
+window.addEventListener('hashchange', () => navTo(location.hash.slice(1)));
+function header(title, subtitle, eyebrow = 'YOUR COMPANION') {
+  return `<div class="page-header"><div><p class="eyebrow">${eyebrow}</p><h1>${title}</h1><p class="page-subtitle">${subtitle}</p></div><div class="header-actions"><span class="demo-pill">DEMO DATA</span><button class="icon-button" data-view="alerts" aria-label="View alerts">${icon('bell')}</button><button class="header-avatar" data-view="settings" aria-label="Edit your profile">${esc(initials(store.state.profile.name))}</button></div></div>`;
 }
-function contactSummary(){return state.contacts.slice(0,2).map((c,i)=>`<div class="contact"><div class="avatar ${i%2?'rose':''}">${esc(initials(c.name))}</div><div><div class="name">${esc(c.name)}</div><div class="role">${esc(c.role)}</div></div><span class="contact-priority">${i===0?'PRIMARY':'BACKUP'}</span></div>`).join('')||'<p class="small-description">Add a safety contact before sending an alert.</p>';}
-function activityRow(e){const t=TYPES[e.type]||TYPES.manual;return `<button class="activity-row" data-action="event" data-id="${esc(e.id)}"><span class="row-symbol ${e.type==='manual'||e.type==='removal'?'alert':''}">${icon(t.icon)}</span><span class="row-main"><span class="row-title">${esc(t.title)}</span><span class="row-subtitle" style="display:block">${e.status==='acknowledged'?`Acknowledged by ${esc(e.ackBy)}`:'Waiting for a safety contact to reply'}</span></span><span class="row-time">${date(e.created)}<br>${time(e.created)}</span></button>`;}
-function deviceReadiness(){
- // Keep urgent check-ins visible; disconnected sensor readings are last known.
- if(state.fallDue)return {
-  status:'urgent', badge:'FALL CHECK-IN', heading:'Are you okay?',
-  description:state.connected?'A possible fall was detected. Tap “I’m okay” above to cancel the check-in.':'A simulated fall check-in is active. Tap “I’m okay” above to cancel. Bluetooth is disconnected; device readings are last known.'
- };
- if(!state.connected)return {
-  status:'disconnected', badge:'CONNECTION LOST', heading:'Let’s get you reconnected.',
-  description:'Device readings are last known. Keep your phone nearby; queued events will sync after reconnection.'
- };
- if(!state.worn)return {
-  status:'warning', badge:'SKIN CONTACT LOST', heading:'Check your wearable.',
-  description:'Skin contact is not detected. Adjust the strap so your wearable sits securely against your wrist.'
- };
- if(state.battery<=20)return {
-  status:'warning', badge:'LOW BATTERY', heading:'Time to recharge.',
-  description:`Your wearable battery is at ${state.battery}%. ${state.charging?'Keep it connected to USB-C while it recharges.':'Connect it to a USB-C charger.'}`
- };
- return {
-  status:'normal', badge:'WEARABLE CONNECTED', heading:'Ready when you need it.',
-  description:'Your wearable and phone are in sync. One less thing on your mind.'
- };
+function notices() {
+  const d = device.getStatus(), fall = device.visibleFall(); let html = '';
+  if (!d.current) html += `<div class="notice error">${icon('offline')}<span class="notice-copy"><strong>${d.connection === 'disconnected' ? 'Wearable disconnected.' : 'Connection in progress.'}</strong> Device readings are last known. Phone alerts require a connection.</span><button class="button" data-action="reconnect" ${d.connection !== 'disconnected' ? 'disabled' : ''}>Reconnect</button></div>`;
+  if (d.current && (!d.worn || d.components.contact !== 'ok')) html += `<div class="notice">${icon('contact')}<span class="notice-copy"><strong>Check your wearable.</strong> Skin contact is ${d.components.contact === 'ok' ? 'not detected' : 'unavailable'}.</span><button class="button" data-view="device">View device</button></div>`;
+  if (d.battery <= 20) html += `<div class="notice">${icon('battery')}<span class="notice-copy"><strong>${d.current ? 'Battery is low' : 'Last known battery was low'} (${d.battery}%).</strong> ${d.current ? 'Connect a USB-C charger.' : 'Reconnect to update the reading.'}</span></div>`;
+  if (fall) html += `<div class="notice error">${icon('activity')}<span class="notice-copy"><strong>Possible fall check-in.</strong> <span data-fall-count>${Math.max(0,Math.ceil((fall.dueAt-store.now())/1000))}</span>s remaining.${fall.repeats ? ` ${fall.repeats} repeated detection(s); the deadline is unchanged.` : ''}${fall.interrupted ? ' Restored after an interrupted session.' : ''}</span><button class="button" data-action="cancel-fall" ${!d.current ? 'disabled' : ''}>I'm okay</button></div>`;
+  return html;
 }
-function overviewPage(){
- const readiness=deviceReadiness();
- const first=esc(state.profile.name.split(' ')[0]||'there');
- return header(`Good morning, ${first}.`,'A quick check before you head out.',new Date().toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'}))+notices()+`
- <div class="content-grid"><div class="main-stack">
- <section class="panel hero" aria-label="Wearable connection overview"><div class="hero-copy"><span class="status-tag readiness-${readiness.status}"><span class="small-dot"></span>${readiness.badge}</span><h2>${readiness.heading}</h2><p>${readiness.description}</p><button class="text-link" data-view="device">${state.connected?'Manage device':'Check connection'} ${icon('arrow')}</button></div><img class="wearable-illustration" src="./assets/wearable.svg" alt="Concept illustration of the CCEW wrist-worn alert device"><div class="hero-bottom"><span class="hero-device-name">${icon('watch')} CCEW-024 <span style="color:#adb79e">/</span> Wrist wearable</span><span class="hero-sync">${icon('sync')} ${state.connected?'Synced just now':'Last seen '+time(state.lastSync)}</span></div></section>
- <div class="metrics"><section class="panel metric"><p class="metric-label">Device battery ${icon('battery')}</p><div class="metric-value ${state.battery<=20?'':'good-text'}">${state.battery}<span style="font-size:13px">%</span></div><div class="metric-detail">${!state.connected?'Last known level':state.charging?'Charging via USB-C':state.battery<=20?'Connect a USB-C charger':'Ready for your day'}</div><div class="battery-track"><span style="width:${state.battery}%;${state.battery<=20?'background:#c39b61':''}"></span></div></section><section class="panel metric"><p class="metric-label">Skin contact ${icon('contact')}</p><div class="metric-value good-text">${!state.connected?'Unknown':state.worn?'On wrist':'Check fit'}</div><div class="metric-detail">${!state.connected?'Reconnect to update':state.worn?'Contact detected':'Contact not detected'}</div></section><section class="panel metric"><p class="metric-label">Fall detection ${icon('activity')}</p><div class="metric-value good-text">${state.connected?'Active':'Last seen'}</div><div class="metric-detail">${state.connected?'Motion sensing is on':'Active before disconnect'}</div></section></div>
- <section class="alert-banner"><div class="alert-icon">${icon('alert')}</div><div class="alert-copy"><h2>Support, a tap away.</h2><p>Send an alert to your safety contacts.</p></div><button class="button danger" data-action="send-alert">Send alert ${icon('arrow')}</button></section>
- <section class="panel recent-panel"><div class="panel-header"><h2>Recent activity</h2><button class="text-link" data-view="alerts">View all ${icon('arrow')}</button></div>${[...state.events].sort((a,b)=>b.created-a.created).slice(0,3).map(activityRow).join('')||'<p class="small-description" style="padding-bottom:20px">No alerts yet. A little quiet is a good thing.</p>'}</section>
- </div><aside class="side-stack" aria-label="Audio and safety contacts">
- <section class="panel audio-card"><div class="audio-top"><span class="audio-symbol">${icon('mic')}</span><span class="audio-state"><span class="small-dot"></span>${state.connected?'Rolling buffer active':'Last seen buffering'}</span></div><h2>A little context.<br>When it matters.</h2><p>Audio around an alert gives your safety contacts a clearer picture.</p>${wave()}<div class="wave-labels"><span>20s BEFORE</span><span>ALERT</span><span>20s AFTER</span></div><div class="audio-footer">${icon('lock')} ${state.connected?'Saved with an alert event':'Recording status updates on reconnect'}</div></section>
- <section class="panel contacts-card"><div class="panel-header"><h2>Your safety circle</h2><button class="text-link" data-view="contacts" aria-label="Manage safety contacts">${icon('edit')}</button></div>${contactSummary()}<p class="contacts-note">${state.contacts.length?'These are the people notified when you need support.':'Your safety contacts will appear here.'}</p></section>
- <section class="small-panel">${icon('checkcircle')}<div><h3>A quick confidence check</h3><p>Test your connection and feedback.</p></div><button class="text-link" data-action="device-check" aria-label="Run a device check">${icon('arrow')}</button></section>
- </aside></div>`;
+function render() {
+  if (!NAV.some(n => n[0] === view)) view = 'overview';
+  const d = device.getStatus(); document.body.classList.toggle('reduced-motion',store.state.settings.reducedMotion);
+  document.title = `${NAV.find(n => n[0] === view)[2]} · CCEW Companion`;
+  document.querySelector('#desktop-nav').innerHTML = NAV.map(([id,i,name]) => `<a class="nav-link ${view === id ? 'active' : ''}" ${view === id ? 'aria-current="page"' : ''} href="#${id}">${icon(i)}<span class="nav-label">${name}</span>${id === 'alerts' && pendingCount() ? `<span class="nav-number">${pendingCount()}</span>` : ''}</a>`).join('');
+  document.querySelector('#mobile-nav').innerHTML = NAV.map(([id,i,name]) => `<a class="${view === id ? 'active' : ''}" ${view === id ? 'aria-current="page"' : ''} href="#${id}">${icon(i)}<span>${name === 'My device' ? 'Device' : name}</span></a>`).join('');
+  document.querySelector('#sidebar-connection').innerHTML = `<span class="small-dot"></span><span><strong>${esc(d.connection[0].toUpperCase() + d.connection.slice(1))}</strong><small>CCEW-024 · ${d.battery}%${!d.current ? ' (last known)' : ' simulated charge'}</small></span>`;
+  document.querySelector('#main').innerHTML = ({ overview:overviewPage, device:devicePage, alerts:alertsPage, contacts:contactsPage, settings:settingsPage }[view])();
+  needsRender = false; hydrateIcons();
 }
-function settingRow(symbol,title,description,right){return `<div class="setting-row"><span class="setting-symbol">${icon(symbol)}</span><div class="row-main"><strong>${title}</strong><p>${description}</p></div>${right}</div>`;}
-function switchButton(key,label,checked){return `<button class="switch" role="switch" aria-label="${esc(label)}" aria-checked="${checked}" data-action="setting-toggle" data-key="${key}"></button>`;}
-function devicePage(){return header('A closer look at your wearable.','Connection, contact, and a little everyday reassurance.','MY DEVICE')+notices()+`
- <div class="wide-grid"><div class="main-stack"><section class="panel device-hero"><img src="./assets/wearable.svg" alt="CCEW wrist wearable concept"><div><span class="status-tag"><span class="small-dot"></span>${state.connected?'CONNECTED VIA BLUETOOTH':'BLUETOOTH DISCONNECTED'}</span><h2>CCEW-024</h2><p>Your wrist-worn<br>community response companion.</p><div class="device-info"><span>Paired to this phone</span><span>Demo device</span></div></div></section>
- <section class="panel"><div class="settings-heading"><h2>The essentials</h2></div><div class="settings-list">${settingRow('bluetooth','Bluetooth connection',state.connected?'Your phone and wearable are in sync.':'Wearable events are stored until it reconnects.',`<button class="button" data-action="${state.connected?'pairing-info':'reconnect'}">${state.connected?'Details':'Reconnect'}</button>`)}${settingRow('contact','Skin contact',!state.connected?'Current contact is unknown until reconnection.':state.worn?'Contact is detected at the back of your wearable.':'Adjust the strap so the contacts meet your skin.',`<span class="pill ${!state.connected||!state.worn?'pending':''}">${!state.connected?'Unknown':state.worn?'Detected':'Check fit'}</span>`)}${settingRow('activity','Fall detection','Motion sensing supports automatic fall alerts.',`<span class="pill ${!state.connected?'neutral':''}">${state.connected?'Active':'Last seen active'}</span>`)}${settingRow('mic','Audio buffer','20 seconds before and 20 seconds after an alert.',`<span class="pill ${!state.connected?'neutral':''}">${state.connected?'Buffering':'Last known'}</span>`)}${settingRow('vibration','Acknowledgement feedback','A haptic pulse confirms a safety contact’s reply.',`<button class="button" data-action="haptic-test">Test</button>`)}</div></section></div>
- <div class="side-stack"><section class="panel panel-pad"><div class="panel-header"><h2>Battery & charging</h2>${icon('battery')}</div><div class="battery-visual"><span class="battery-big">${state.battery}%</span><div class="battery-description"><strong>${state.charging?'Charging via USB-C':state.battery<=20?'Time for a recharge':'A little power for your day'}</strong>${state.connected?'Current demo level':'Last known demo level'}</div></div><div class="battery-track"><span style="width:${state.battery}%"></span></div><div class="info-lines section-gap"><div class="info-line"><span>Charging method</span><strong>USB-C</strong></div><div class="info-line"><span>Battery-life design target</span><strong>12 hours</strong></div><div class="info-line"><span>Runtime estimate</span><strong>Not measured</strong></div></div><p class="audio-micro-note">The 12-hour target needs verification with the final battery and hardware.</p></section>
- <section class="panel panel-pad"><div class="panel-header"><h2>Before your next visit</h2>${icon('checkcircle')}</div><p class="small-description">Run a quick check of the demo connection, skin contact, motion sensing, and feedback.</p><button class="button primary full section-gap" data-action="device-check">Run device check ${icon('arrow')}</button></section></div></div>`;}
-function eventCard(e){const t=TYPES[e.type]||TYPES.manual;return `<button class="panel event-card" data-action="event" data-id="${esc(e.id)}"><span class="row-symbol ${['manual','removal'].includes(e.type)?'alert':''}">${icon(t.icon)}</span><span class="row-main"><span class="row-title">${esc(t.title)}</span><span class="row-subtitle" style="display:block">${e.status==='acknowledged'?esc(e.ackBy)+' replied':e.hapticPending?'Feedback waiting for reconnection':'Your safety contacts have not replied yet'}</span></span><span class="event-meta">${statusPill(e)}<span class="row-time">${date(e.created)} · ${time(e.created)}</span></span><span class="event-chevron">${icon('chevron')}</span></button>`;}
-function alertsPage(){let events=[...state.events].sort((a,b)=>b.created-a.created);if(filter==='pending')events=events.filter(e=>e.status==='awaiting');if(filter==='acknowledged')events=events.filter(e=>e.status==='acknowledged');return header('A clear picture of every alert.','Follow an event from your wrist to a safety contact’s reply.','ALERT HISTORY')+notices()+`
- <div class="alerts-toolbar"><div class="tabs" role="tablist" aria-label="Filter alerts">${[['all','All events'],['pending','Awaiting reply'],['acknowledged','Acknowledged']].map(([id,n])=>`<button class="tab ${filter===id?'active':''}" role="tab" aria-selected="${filter===id}" data-action="filter" data-key="${id}">${n}</button>`).join('')}</div><button class="button" data-action="send-alert">${icon('plus')} New alert</button></div>
- ${!state.connected?'<div class="queue-callout" style="margin-bottom:20px">New events created on the wearable while disconnected are not visible on this phone yet. Reconnect to retrieve them. Audio uploads already known to this app will resume too.</div>':''}
- <div class="event-list">${events.map(eventCard).join('')||`<section class="panel empty-state">${icon('checkcircle')}<h2>${filter==='pending'?'No replies to wait for.':'Nothing here yet.'}</h2><p>${filter==='pending'?'Your visible alerts are acknowledged.':'Events matching this view will appear here.'}</p></section>`}</div><p class="event-demo-label">${icon('info')} All events in this prototype are simulated. No messages are sent.</p>`;}
-function contactsPage(){return header('Your people, within reach.','Choose the people who receive your wearable alerts.','SAFETY CONTACTS')+`<div class="contacts-intro">Your primary and backup contacts make up your safety circle. Contact details stay in this browser in the prototype; there is no delivery service connected.</div><div class="panel-header"><h2>${state.contacts.length} safety contact${state.contacts.length===1?'':'s'}</h2><button class="button primary" data-action="add-contact">${icon('plus')} Add contact</button></div><div class="contact-grid">${state.contacts.map((c,i)=>`<section class="panel contact-profile"><div class="contact-profile-top"><div class="avatar ${i%2?'rose':''}">${esc(initials(c.name))}</div><div><h2>${esc(c.name)}</h2><p>${esc(c.role)}</p></div></div><div class="contact-details"><div>${icon('phone')} ${esc(c.phone)}</div><div>${icon('mail')} ${esc(c.email||'No email added')}</div></div><div class="contact-profile-bottom"><span class="pill ${i?'neutral':''}">${i===0?'Primary contact':'Backup contact'}</span><div style="display:flex;gap:15px"><button class="text-link" data-action="edit-contact" data-id="${esc(c.id)}">Edit ${icon('edit')}</button><button class="text-link danger-link" data-action="delete-contact" data-id="${esc(c.id)}" aria-label="Remove ${esc(c.name)}">${icon('trash')}</button></div></div></section>`).join('')||`<section class="panel empty-state" style="grid-column:1/-1">${icon('users')}<h2>Start with someone you trust.</h2><p>Add a primary safety contact to set up your circle.</p><button class="button primary" data-action="add-contact">Add your first contact</button></section>`}</div><section class="notification-card panel section-gap"><h2>What does a contact receive?</h2><p>The proposed alert includes your name, event type, time, and the audio around the event. Acknowledgements are shown separately from delivery, so you can tell whether someone has replied.</p></section>`;}
-function settingsPage(){return header('Make it feel like yours.','A few details that help your team stay connected.','SETTINGS')+`<div class="wide-grid"><div class="main-stack"><section class="panel profile-panel"><div class="profile-head"><div class="avatar">${esc(initials(state.profile.name))}</div><div><h2>Your responder profile</h2><p>Included with a proposed alert notification.</p></div></div><form id="profile-form"><label class="form-field">Full name<input name="name" autocomplete="name" required maxlength="70" value="${esc(state.profile.name)}"></label><div class="form-grid"><label class="form-field">Role<input name="role" maxlength="70" required value="${esc(state.profile.role)}"></label><label class="form-field">Team / organization<input name="organization" maxlength="90" value="${esc(state.profile.organization)}"></label></div><button class="button primary" type="submit">Save profile ${icon('check')}</button></form></section>
- <section class="panel"><div class="settings-heading"><h2>Notifications & display</h2></div><div class="settings-list">${settingRow('bluetooth','Connection notices','Show a toast when the wearable disconnects.',switchButton('disconnectNotice','Connection notices',state.settings.disconnectNotice))}${settingRow('contact','Skin-contact notices','Show a toast when simulated skin contact is lost.',switchButton('contactNotice','Skin-contact notices',state.settings.contactNotice))}${settingRow('moon','Reduce motion','Keep screen transitions and progress effects still.',switchButton('reducedMotion','Reduce motion',state.settings.reducedMotion))}</div></section></div>
- <div class="side-stack"><section class="panel panel-pad"><div class="panel-header"><h2>A reply you can feel.</h2>${icon('vibration')}</div><p class="small-description">The wearable gives haptic feedback after a safety contact acknowledges your alert.</p><label class="form-field section-gap">Demo acknowledgement pattern<select id="haptic-pattern"><option ${state.settings.hapticPattern==='Two short pulses'?'selected':''}>Two short pulses</option><option ${state.settings.hapticPattern==='One long pulse'?'selected':''}>One long pulse</option></select></label><button class="button full" data-action="haptic-test">Preview haptic pattern ${icon('vibration')}</button></section>
- <section class="panel panel-pad"><div class="panel-header"><h2>About this prototype</h2>${icon('info')}</div><p class="small-description">A wearer-facing design for the CCEW capstone. Device data, contact messages, recordings, and acknowledgements are simulated.</p><div class="info-lines section-gap"><div class="info-line"><span>Form factor</span><strong>Wrist-worn</strong></div><div class="info-line"><span>Charging</span><strong>USB-C</strong></div><div class="info-line"><span>Removal sensing</span><strong>Skin contact</strong></div></div><button class="button full section-gap" data-action="demo-controls">Open demo controls ${icon('sliders')}</button></section></div></div>`;}
-
-function showModal(content){stopPlayback();modal.innerHTML=`<button class="modal-close" data-action="close-modal" aria-label="Close dialog">${icon('x')}</button>${content}`;if(!modal.open)modal.showModal();syncActiveAudio();}
-function closeModal(){stopPlayback();if(modal.open)modal.close();activeEvent=null;}
-modal.addEventListener('close',()=>{if(!modal.open){stopPlayback();activeEvent=null;}});
-function alertModal(){showModal(`<div class="modal-hero-icon">${icon('alert')}</div><p class="demo-label">DEMO ALERT</p><h2 id="modal-title" class="modal-title">A little support is a tap away.</h2><p class="modal-lead">${state.connected?'This simulates pressing your wearable’s alarm button. Your safety circle receives a simulated alert, and a 20-second post-event audio window begins.':'The wearable is disconnected. This will create an event on the simulated wearable; it becomes visible on the phone after reconnection.'}</p><div class="queue-callout">This prototype sends no messages and does not contact emergency services.</div><div style="margin-top:18px">${contactSummary()}</div><div class="modal-actions"><button class="button" data-action="close-modal">Go back</button>${state.contacts.length?'<button class="button danger" data-action="confirm-alert">Create demo alert</button>':'<button class="button primary" data-action="go-contacts">Add a contact first</button>'}</div>`);}
-function createEvent(type='manual'){
- const now=Date.now();const e={id:`event-${now}-${Math.random().toString(36).slice(2,7)}`,type,created:now,status:'awaiting',received:state.connected?now:null,acknowledged:null,ackBy:null,audioReadyAt:now+20000,audioSynced:false,hapticPending:false};
- if(state.connected)state.events.unshift(e);else state.deviceOutbox.push(e);
- save();render();return e;
+function contactSummary() {
+  return store.state.contacts.slice(0,2).map((c,i) => `<div class="contact"><div class="avatar ${i ? 'rose' : ''}">${esc(initials(c.name))}</div><div><div class="name">${esc(c.name)}</div><div class="role">${esc(c.role)}</div></div><span class="contact-priority">${i ? 'BACKUP' : 'PRIMARY'}</span></div>`).join('') || '<p class="small-description">Add a safety contact to enable simulated delivery.</p>';
 }
-function reconnect(){const amount=state.deviceOutbox.length;state.connected=true;state.lastSync=Date.now();for(const e of state.deviceOutbox){e.received=Date.now();state.events.unshift(e);}state.deviceOutbox=[];let feedback=false;for(const e of state.events){if(Date.now()>=e.audioReadyAt)e.audioSynced=true;if(e.hapticPending){e.hapticPending=false;feedback=true;}}save();closeModal();render();toast(amount?`${amount} queued demo event${amount===1?'':'s'} synced from the wearable.`:feedback?'Reconnected. Pending demo haptic feedback delivered.':'Demo wearable reconnected.');}
-function acknowledge(id){const e=state.events.find(x=>x.id===id);if(!e||e.status!=='awaiting')return;e.status='acknowledged';e.acknowledged=Date.now();e.ackBy=state.contacts[0]?.name||'Demo safety contact';e.hapticPending=!state.connected;save();render();toast(state.connected?'Demo reply received. Wrist feedback: '+state.settings.hapticPattern.toLowerCase()+'.':'Demo reply received. Wrist feedback waits for reconnection.');if(modal.open&&activeEvent===id)eventModal(id);else closeModal();}
-function demoModal(){showModal(`<p class="demo-label">INTERACTIVE PROTOTYPE</p><h2 id="modal-title" class="modal-title">Try the moments that matter.</h2><p class="modal-lead">Change the simulated wearable state. These controls test the UI without connecting hardware or sending messages.</p>
- <div class="demo-option"><div><h3>Bluetooth connection</h3><p>${state.connected?'Connected to the demo phone':'Disconnected · phone shows last-known data'}</p></div><button class="switch" role="switch" aria-label="Demo Bluetooth connection" aria-checked="${state.connected}" data-action="demo-connection"></button></div>
- <div class="demo-option"><div><h3>Skin contact</h3><p>${state.worn?'On wrist · contact detected':'Off wrist · a removal event is created'}</p></div><button class="switch" role="switch" aria-label="Demo skin contact" aria-checked="${state.worn}" data-action="demo-contact"></button></div>
- <div class="demo-option"><div><h3>Low battery</h3><p>Preview a 14% battery warning.</p></div><button class="switch" role="switch" aria-label="Demo low battery" aria-checked="${state.battery<=20}" data-action="demo-battery"></button></div>
- <div class="demo-option"><div><h3>USB-C charging</h3><p>${state.charging?'Charging cable connected':'Charging cable disconnected'}</p></div><button class="switch" role="switch" aria-label="Demo USB-C charging" aria-checked="${state.charging}" data-action="demo-charging"></button></div>
- <div class="demo-option"><div><h3>Wearable alarm button</h3><p>${state.connected?'Creates an alert on the phone':'Stored on the wearable until it reconnects'}</p></div><button class="button" data-action="simulate-alarm">Press button</button></div>
- <div class="demo-option"><div><h3>Possible fall</h3><p>Try a 10-second check-in before an alert.</p></div><button class="button" data-action="simulate-fall" ${state.fallDue?'disabled':''}>Simulate fall</button></div>
- <div class="demo-option"><div><h3>Safety contact reply</h3><p>Acknowledges the newest visible pending alert.</p></div><button class="button" data-action="ack-latest" ${!pendingCount()?'disabled':''}>Acknowledge</button></div>
- <div class="queue-callout">Simulator only: ${state.deviceOutbox.length} event${state.deviceOutbox.length===1?'':'s'} stored on the wearable. This count is deliberately hidden from the phone while Bluetooth is disconnected.</div>
- <div class="modal-actions"><button class="button ghost" data-action="reset-demo">Reset demo data</button><button class="button primary" data-action="close-modal">Done</button></div>`);}
-function eventModal(id){const e=state.events.find(x=>x.id===id);if(!e)return;activeEvent=id;const t=TYPES[e.type]||TYPES.manual;const ready=Date.now()>=e.audioReadyAt;showModal(`<p class="demo-label">SIMULATED EVENT · ${date(e.created)} AT ${time(e.created)}</p><h2 id="modal-title" class="modal-title">${esc(t.title)}</h2>${statusPill(e)}<ol class="timeline"><li><span class="timeline-dot"></span><div><strong>Event captured on wearable</strong><p>${time(e.created)} · ${esc(t.short)}</p></div></li><li><span class="timeline-dot"></span><div><strong>Phone received the event</strong><p>${time(e.received||e.created)} · Metadata received in this demo</p></div></li><li><span class="timeline-dot ${e.status!=='acknowledged'?'waiting':''}"></span><div><strong>${e.status==='acknowledged'?'Safety contact acknowledged':'Waiting for a safety contact’s reply'}</strong><p>${e.status==='acknowledged'?esc(e.ackBy)+' · '+time(e.acknowledged):'Delivery and acknowledgement are separate states.'}</p></div></li>${e.status==='acknowledged'?`<li><span class="timeline-dot ${e.hapticPending?'waiting':''}"></span><div><strong>${e.hapticPending?'Wrist feedback pending':'Haptic feedback acknowledged'}</strong><p>${e.hapticPending?'Will be delivered when the wearable reconnects.':esc(state.settings.hapticPattern)+' · simulated'}</p></div></li>`:''}</ol>
- <div class="audio-block"><div class="audio-summary"><strong>Event audio</strong><span data-audio-status>${ready?(state.connected?'Ready · 40s':'Upload queued · 40s'):'Capturing post-event audio'}</span></div>${wave()}<div class="wave-labels" style="color:#9aa98c"><span>−20s</span><span>ALERT</span><span>+20s</span></div><div class="audio-controls section-gap"><button class="play-button" data-action="play-audio" aria-label="Play synthetic audio sample" ${!ready?'disabled':''}>${icon('play')}</button><input class="audio-range" id="audio-seek" aria-label="Seek in synthetic audio" type="range" min="0" max="40" value="0" step=".1" ${!ready?'disabled':''}><span class="audio-time" id="audio-time">0:00 / 0:40</span></div><p class="playback-state" id="playback-state">${ready?'Synthetic sample audio for UI review.':`20s pre-event buffer saved. ${Math.max(0,Math.ceil((e.audioReadyAt-Date.now())/1000))}s of post-event capture remaining.`}</p></div><p class="audio-micro-note">No microphone is used. Playback and downloads contain a generated tone sample, not a real recording.</p>
- <div class="modal-actions"><button class="button" data-action="download-audio" ${!ready?'disabled':''}>${icon('download')} Demo audio</button>${e.status==='awaiting'?`<button class="button primary" data-action="ack-event" data-id="${esc(e.id)}">Simulate acknowledgement</button>`:'<button class="button primary" data-action="close-modal">Done</button>'}</div>`);activeEvent=id;}
-function contactModal(id=null){
- const c=state.contacts.find(x=>x.id===id)||{id:'',name:'',role:'Safety representative',phone:'',email:''};
- const phonePattern=String.raw`[+0-9\(\) .\-]{7,30}`;
- showModal(`<p class="demo-label">YOUR SAFETY CIRCLE</p><h2 id="modal-title" class="modal-title">${id?'Edit safety contact.':'Add someone you trust.'}</h2><p class="modal-lead">Contact information is stored only in this browser for the prototype.</p>
- <form id="contact-form" data-id="${esc(c.id)}">
- <label class="form-field">Full name<input name="name" required maxlength="70" autocomplete="name" placeholder="e.g. Jordan Lee" value="${esc(c.name)}"></label>
- <label class="form-field">Relationship / role<input name="role" required maxlength="70" placeholder="e.g. Team supervisor" value="${esc(c.role)}"></label>
- <label class="form-field">Phone number<input name="phone" type="tel" required maxlength="30" pattern="${phonePattern}" autocomplete="tel" placeholder="(555) 010-0000" value="${esc(c.phone)}"></label>
- <label class="form-field">Email <span style="font-weight:400">(optional)</span><input name="email" type="email" maxlength="120" autocomplete="email" placeholder="name@example.com" value="${esc(c.email)}"></label>
- <div class="modal-actions"><button class="button" type="button" data-action="close-modal">Cancel</button><button class="button primary" type="submit">Save contact ${icon('check')}</button></div></form>`);
+function activityRow(event) {
+  const type = TYPES[event.type] || TYPES.manual;
+  return `<button class="activity-row" data-action="event" data-id="${esc(event.id)}"><span class="row-symbol">${icon(type.icon)}</span><span class="row-main"><span class="row-title">${type.title}</span><span class="row-subtitle">${event.responder ? `Acknowledged by ${esc(event.responder.name)}` : esc(STATUS[alerts.status(event)])}</span></span><span class="row-time">${esc(time(event.detectedAt))}</span></button>`;
 }
-function deviceCheck(){const results=[['bluetooth','Bluetooth',state.connected,'Connected','Out of range'],['contact','Skin contact',state.connected&&state.worn,'Contact detected',state.connected?'Adjust the strap':'Unknown while disconnected'],['activity','Motion sensing',state.connected,'Demo sensor active','Last known status only'],['vibration','Feedback path',state.connected,'Demo haptic ready','Requires reconnection']];showModal(`<p class="demo-label">QUICK DEVICE CHECK</p><h2 id="modal-title" class="modal-title">A moment to check in.</h2><p class="modal-lead">A simulated check of the four essentials before your next visit.</p><div class="progress-track"><div class="progress-fill"></div></div><div class="check-grid">${results.map(([i,n,ok,yes,no])=>`<div class="check-item ${!ok?'fail':''}">${icon(i)}<strong>${n}</strong><p>${ok?yes:no}</p></div>`).join('')}</div><div class="check-results">${results.every(x=>x[2])?'The demo connection and contact checks passed.':'There’s something to check. Review the highlighted items before relying on the device.'} This UI check does not test real hardware.</div><div class="modal-actions"><button class="button primary" data-action="close-modal">Done ${icon('check')}</button></div>`);}
-function hapticTest(){if(!state.connected){toast('Reconnect the demo wearable to preview feedback.',true);return;}showModal(`<div class="modal-hero-icon" style="background:#eef4e5;border-color:#e0e9d4;color:#789267">${icon('vibration')}</div><p class="demo-label">HAPTIC PREVIEW</p><h2 id="modal-title" class="modal-title">A quiet signal.<br>A clear reply.</h2><p class="modal-lead">${esc(state.settings.hapticPattern)} represents a safety contact acknowledging your alert. This prototype shows the pattern visually; it does not vibrate your wearable or phone.</p><div class="check-results" style="display:flex;justify-content:center;gap:18px;padding:30px">${state.settings.hapticPattern==='Two short pulses'?'<span style="width:45px;height:12px;border-radius:8px;background:#7e9c68"></span><span style="width:45px;height:12px;border-radius:8px;background:#7e9c68"></span>':'<span style="width:125px;height:12px;border-radius:8px;background:#7e9c68"></span>'}</div><div class="modal-actions"><button class="button primary" data-action="close-modal">Got it</button></div>`);}
-
-function syncActiveAudio(){
- if(!modal.open||!activeEvent)return;
- const e=state.events.find(x=>x.id===activeEvent);if(!e)return;
- const remaining=Math.max(0,Math.ceil((e.audioReadyAt-Date.now())/1000));
- const status=modal.querySelector('[data-audio-status]'),p=modal.querySelector('#playback-state');
- if(status)status.textContent=remaining?'Capturing post-event audio':e.audioSynced?'Ready · 40s':'Upload queued · 40s';
- modal.querySelectorAll('[data-action="play-audio"],[data-action="download-audio"],#audio-seek').forEach(b=>b.disabled=Boolean(remaining)||!e.audioSynced);
- if(p&&!playingAudio)p.textContent=remaining?`20s pre-event buffer saved. ${remaining}s of post-event capture remaining.`:e.audioSynced?'Synthetic sample audio for UI review.':'Audio is queued on the wearable until reconnection.';
+function overviewPage() {
+  const readiness = deviceReadiness(), d = device.getStatus(), first = esc(store.state.profile.name.split(' ')[0] || 'there');
+  return header(`${greeting()}, ${first}.`,'A quick check before you head out.',new Date().toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric'})) + notices() + `
+    <div class="content-grid"><div class="main-stack">
+      <section class="panel hero" aria-label="Wearable readiness"><div class="hero-copy"><span class="status-tag readiness-${readiness.status}"><span class="small-dot"></span>${readiness.badge}</span><h2>${readiness.heading}</h2><p>${readiness.description}</p><button class="text-link" data-view="device">Manage device ${icon('arrow')}</button></div><img class="wearable-illustration" src="./assets/wearable.svg" alt="Concept illustration of the CCEW wrist-worn alert device"><div class="hero-bottom"><span class="hero-device-name">${icon('watch')} CCEW-024 / Wrist wearable</span><span class="hero-sync">${icon('sync')} ${d.current ? 'Simulated readings' : 'Last seen ' + time(d.lastSync)}</span></div></section>
+      <div class="metrics">
+        <section class="panel metric"><p class="metric-label">Device battery ${icon('battery')}</p><div class="metric-value ${d.battery > 20 ? 'good-text' : ''}">${d.battery}<span class="metric-unit">%</span></div><div class="metric-detail">${!d.current ? 'Last known level' : d.charging ? 'Charging via USB-C' : d.battery <= 20 ? 'Connect a charger' : 'Simulated charge'}</div><div class="battery-track"><span style="width:${d.battery}%"></span></div></section>
+        <section class="panel metric"><p class="metric-label">Skin contact ${icon('contact')}</p><div class="metric-value">${!d.current ? 'Unknown' : d.components.contact !== 'ok' ? 'Unavailable' : d.contactCandidateAt !== null ? 'Checking' : d.worn ? 'On wrist' : 'Check fit'}</div><div class="metric-detail">${!d.current ? 'Reconnect to update' : '1.5s stable reading'}</div></section>
+        <section class="panel metric"><p class="metric-label">Fall detection ${icon('activity')}</p><div class="metric-value">${!d.current ? 'Last seen' : d.components.motion === 'ok' ? 'Active' : 'Failed'}</div><div class="metric-detail">${!d.current ? 'Current status unknown' : d.components.motion === 'ok' ? 'Simulated motion sensor' : 'Run a device check'}</div></section>
+      </div>
+      <section class="alert-banner"><div class="alert-icon">${icon('alert')}</div><div class="alert-copy"><h2>Support, a tap away.</h2><p>${d.current ? 'Create a simulated phone alert.' : 'Reconnect to send a phone alert.'}</p></div><button class="button danger" data-action="send-alert" ${!d.current ? 'disabled' : ''}>Send alert ${icon('arrow')}</button></section>
+      <section class="panel recent-panel"><div class="panel-header"><h2>Recent activity</h2><button class="text-link" data-view="alerts">View all ${icon('arrow')}</button></div>${alerts.visible().slice(0,3).map(activityRow).join('') || '<p class="small-description">No events received by this phone yet.</p>'}</section>
+    </div><aside class="side-stack" aria-label="Audio and safety contacts">
+      <section class="panel audio-card"><div class="audio-top"><span class="audio-symbol">${icon('mic')}</span><span class="audio-state">${!d.current ? 'Last known buffer status' : d.components.audio === 'ok' ? 'Synthetic buffer active' : 'Simulated audio unavailable'}</span></div><h2>A little context.<br>When it matters.</h2><p>Audio around an alert can give your safety contacts a clearer picture.</p>${wave()}<div class="wave-labels"><span>20s BEFORE</span><span>ALERT</span><span>20s AFTER</span></div><div class="audio-footer">${icon('lock')} Synthetic samples only · no microphone</div></section>
+      <section class="panel contacts-card"><div class="panel-header"><h2>Your safety circle</h2><button class="text-link" data-view="contacts" aria-label="Manage safety contacts">${icon('edit')}</button></div>${contactSummary()}<p class="contacts-note">Contact delivery and human acknowledgement are separate simulated steps.</p></section>
+      <section class="small-panel">${icon('checkcircle')}<div><h3>A quick confidence check</h3><p>Check each component individually.</p></div><button class="text-link" data-action="device-check" aria-label="Run a device check">${icon('arrow')}</button></section>
+    </aside></div>`;
+}
+function checkCards() {
+  return `<div class="check-grid">${device.check().map(c => `<div class="check-item ${c.status !== 'passed' ? 'fail' : ''}" data-component="${c.id}"><strong>${esc(c.label)}</strong>${pill(c.status, c.status === 'passed' ? '' : 'pending')}<p>${esc(c.detail)}</p></div>`).join('')}</div>`;
+}
+function devicePage() {
+  const d = device.getStatus(), r = deviceReadiness();
+  return header('A closer look at your wearable.','Connection, contact, and individual component results.','MY DEVICE') + notices() + `
+    <div class="wide-grid"><div class="main-stack"><section class="panel device-hero"><img src="./assets/wearable.svg" alt="CCEW wrist wearable concept"><div><span class="status-tag readiness-${r.status}">${r.badge}</span><h2>CCEW-024</h2><p>Wrist-worn companion<br>Simulated Bluetooth device</p><button class="button" data-action="${d.current ? 'demo-controls' : 'reconnect'}" ${['connecting','syncing'].includes(d.connection) ? 'disabled' : ''}>${d.current ? 'Demo controls' : 'Reconnect'}</button></div></section>
+    <section class="panel panel-pad"><div class="panel-header"><h2>Component checks</h2></div>${checkCards()}<p class="audio-micro-note">Component availability does not confirm that a haptic command completed. Only a simulated wearable response does that.</p></section></div>
+    <div class="side-stack"><section class="panel panel-pad"><div class="panel-header"><h2>Battery & charging</h2>${icon('battery')}</div><div class="battery-visual"><span class="battery-big">${d.battery}%</span><div class="battery-description"><strong>${!d.current ? 'Last known reading' : d.charging ? 'Charging via USB-C' : 'Simulated battery charge'}</strong>No measured runtime estimate</div></div><div class="battery-track"><span style="width:${d.battery}%"></span></div><div class="info-lines"><div class="info-line"><span>Battery-life design target</span><strong>&gt;12 hours</strong></div><div class="info-line"><span>Hardware runtime</span><strong>Not measured</strong></div><div class="info-line"><span>Charging method</span><strong>USB-C</strong></div></div><p class="small-description">More than 12 hours is the design requirement. Battery percentage is simulated and is not a runtime prediction.</p></section>
+    <section class="panel panel-pad"><h2>Try failure conditions</h2><p class="small-description section-gap">Disconnect during transfer, fail a sensor, or confirm a haptic command in Demo controls.</p><button class="button full section-gap" data-action="demo-controls">Open demo controls</button></section></div></div>`;
+}
+function eventCard(event) {
+  const type = TYPES[event.type] || TYPES.manual;
+  return `<button class="panel event-card" data-action="event" data-id="${esc(event.id)}"><span class="row-symbol">${icon(type.icon)}</span><span class="row-main"><span class="row-title">${type.title}</span><span class="row-subtitle event-id">${esc(event.id)}</span><span class="row-subtitle">${stamp(event.detectedAt)}</span><span class="row-subtitle">${event.responder ? `Reply: ${esc(event.responder.name)} · ${esc(HAPTIC[event.haptic.status])}` : `Phone transfer: ${esc(event.transfer.status)} · Contact delivery: ${esc(event.delivery.status)}`}</span><span class="row-subtitle">Audio: ${esc(audio.description(event))}</span></span><span class="event-meta">${statusPill(event)}</span></button>`;
+}
+function alertsPage() {
+  const events = alerts.visible().filter(e => (typeFilter === 'all' || e.type === typeFilter) && (statusFilter === 'all' || statusFilter === 'pending' && e.acknowledgedAt === null || statusFilter === 'acknowledged' && e.acknowledgedAt !== null || statusFilter === 'failed' && e.delivery.status === 'failed'));
+  return header('A clear picture of every alert.','Detection, receipt, delivery, reply, and wrist feedback stay separate.','ALERT HISTORY') + notices() + `
+    <div class="alerts-toolbar"><label class="filter-label">Reply status<select id="status-filter">${[['all','All statuses'],['pending','Awaiting reply'],['acknowledged','Acknowledged'],['failed','Delivery failed']].map(([value,label]) => `<option value="${value}" ${statusFilter === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label><label class="filter-label">Event type<select id="type-filter"><option value="all">All types</option>${Object.entries(TYPES).map(([value,t]) => `<option value="${value}" ${typeFilter === value ? 'selected' : ''}>${t.title}</option>`).join('')}</select></label><button class="button" data-action="send-alert" ${!ble.isReady() ? 'disabled' : ''}>${icon('plus')} Phone alert</button></div>
+    ${!ble.isReady() ? '<div class="queue-callout section-gap">The phone cannot see new wearable events while disconnected. Its history shows only events already received. Use Demo controls to inspect the simulated wearable queue.</div>' : ''}
+    <div class="event-list section-gap">${events.map(eventCard).join('') || '<section class="panel empty-state"><h2>No matching events.</h2><p>Events appear here after the phone receives them.</p></section>'}</div><p class="event-demo-label">${icon('info')} All messages and recordings are simulated.</p>`;
+}
+function contactsPage() {
+  const contacts = store.state.contacts;
+  return header('Your people, within reach.','Choose a primary contact and order your backups.','SAFETY CONTACTS') + `<div class="panel-header"><h2>${contacts.length} safety contact${contacts.length === 1 ? '' : 's'}</h2><button class="button primary" data-action="add-contact">${icon('plus')} Add contact</button></div>
+    <div class="contact-grid">${contacts.map((c,i) => `<section class="panel contact-profile" data-contact-id="${esc(c.id)}"><div class="contact-profile-top"><div class="avatar ${i ? 'rose' : ''}">${esc(initials(c.name))}</div><div><h2>${esc(c.name)}</h2><p>${esc(c.role)}</p></div></div><div class="contact-details"><div>${icon('phone')} ${esc(c.phone)}</div><div>${icon('mail')} ${esc(c.email || 'No email added')}</div></div>${pill(i ? `Backup ${i}` : 'Primary contact', i ? 'neutral' : '')}<div class="contact-actions"><button class="button" data-action="primary-contact" data-id="${esc(c.id)}" ${!i ? 'disabled' : ''}>${i ? 'Make primary' : 'Primary selected'}</button>${i ? `<button class="button" data-action="move-contact" data-id="${esc(c.id)}" data-direction="-1" ${i === 1 ? 'disabled' : ''} aria-label="Move ${esc(c.name)} up">↑</button><button class="button" data-action="move-contact" data-id="${esc(c.id)}" data-direction="1" ${i === contacts.length - 1 ? 'disabled' : ''} aria-label="Move ${esc(c.name)} down">↓</button>` : ''}<button class="button" data-action="edit-contact" data-id="${esc(c.id)}">Edit</button><button class="button danger-link" data-action="delete-contact" data-id="${esc(c.id)}">Remove</button></div></section>`).join('') || '<section class="panel empty-state"><h2>Add someone you trust.</h2><p>No contacts are configured for simulated delivery.</p></section>'}</div><section class="panel panel-pad section-gap"><h2>History stays accurate</h2><p class="small-description section-gap">Each delivery saves its recipient list. Reordering or deleting a contact does not rewrite the names on old acknowledgements.</p></section>`;
+}
+function settingsPage() {
+  const s = store.state;
+  return header('Make it feel like yours.','Your profile and local demonstration preferences.','SETTINGS') + `<div class="wide-grid"><div class="main-stack"><section class="panel profile-panel"><h2>Your responder profile</h2><form id="profile-form" class="section-gap"><label class="form-field">Full name<input name="name" required maxlength="70" value="${esc(s.profile.name)}"></label><label class="form-field">Role<input name="role" required maxlength="70" value="${esc(s.profile.role)}"></label><label class="form-field">Team / organization<input name="organization" maxlength="90" value="${esc(s.profile.organization)}"></label><button class="button primary" type="submit">Save profile</button></form></section><section class="panel panel-pad"><h2>Display & notices</h2>${[['disconnectNotice','Connection notices'],['contactNotice','Skin-contact notices'],['reducedMotion','Reduce motion']].map(([key,label]) => `<div class="demo-option"><h3>${label}</h3><button class="switch" role="switch" aria-label="${label}" aria-checked="${s.settings[key]}" data-action="setting-toggle" data-key="${key}"></button></div>`).join('')}</section></div><div class="side-stack"><section class="panel panel-pad"><h2>A reply you can feel</h2><p class="small-description section-gap">A contact reply requests wrist feedback. A sent command stays unconfirmed until the simulated wearable responds.</p><label class="form-field section-gap">Acknowledgement pattern<select id="haptic-pattern">${['Two short pulses','One long pulse'].map(p => `<option ${s.settings.hapticPattern === p ? 'selected' : ''}>${p}</option>`).join('')}</select></label><button class="button full" data-action="haptic-test">Preview pattern</button></section><section class="panel panel-pad"><h2>About this prototype</h2><p class="small-description section-gap">No real Bluetooth, microphone, contact messages, or emergency services. Battery-life design target: more than 12 hours; hardware runtime has not been measured.</p><button class="button full section-gap" data-action="demo-controls">Open demo controls</button></section></div></div>`;
 }
 
-function makeSampleURL(){if(audioURL)return audioURL;const rate=16000,seconds=40,n=rate*seconds;const buffer=new ArrayBuffer(44+n*2),dv=new DataView(buffer);const text=(offset,s)=>[...s].forEach((c,i)=>dv.setUint8(offset+i,c.charCodeAt(0)));text(0,'RIFF');dv.setUint32(4,36+n*2,true);text(8,'WAVE');text(12,'fmt ');dv.setUint32(16,16,true);dv.setUint16(20,1,true);dv.setUint16(22,1,true);dv.setUint32(24,rate,true);dv.setUint32(28,rate*2,true);dv.setUint16(32,2,true);dv.setUint16(34,16,true);text(36,'data');dv.setUint32(40,n*2,true);for(let i=0;i<n;i++){const t=i/rate,p=t%4;let v=p<.22?Math.sin(2*Math.PI*(t<20?330:440)*t)*.07*Math.sin(Math.PI*p/.22):0;dv.setInt16(44+i*2,Math.round(v*32767),true);}audioURL=URL.createObjectURL(new Blob([buffer],{type:'audio/wav'}));return audioURL;}
-function stopPlayback(){if(playingAudio){const audio=playingAudio;playingAudio=null;audio.ontimeupdate=null;audio.onended=null;audio.onpause=null;audio.onplay=null;audio.pause();}}
-function playAudio(){if(playingAudio){if(playingAudio.paused){playingAudio.play().catch(()=>toast('Your browser could not play the sample.',true));}else playingAudio.pause();syncPlayButton();return;}
- playingAudio=new Audio(makeSampleURL());playingAudio.ontimeupdate=()=>{const input=document.querySelector('#audio-seek'),label=document.querySelector('#audio-time');if(input)input.value=playingAudio.currentTime;if(label)label.textContent=`${formatDuration(playingAudio.currentTime)} / 0:40`;};playingAudio.onended=()=>{syncPlayButton();const p=document.querySelector('#playback-state');if(p)p.textContent='Synthetic sample finished. Press play to replay.';};playingAudio.onpause=syncPlayButton;playingAudio.onplay=syncPlayButton;const input=document.querySelector('#audio-seek');if(input)playingAudio.currentTime=Number(input.value);playingAudio.play().then(()=>{const p=document.querySelector('#playback-state');if(p)p.textContent='Playing a synthetic tone sample. No real recording.';}).catch(()=>toast('Audio playback is unavailable in this browser.',true));}
-function syncPlayButton(){const b=document.querySelector('[data-action="play-audio"]');if(b){b.innerHTML=icon(playingAudio&&!playingAudio.paused?'pause':'play');b.setAttribute('aria-label',playingAudio&&!playingAudio.paused?'Pause synthetic audio sample':'Play synthetic audio sample');}}
-const formatDuration=s=>`${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`;
+function showModal(content, kind = '') {
+  audio.stop(); activeEvent = null; modal.dataset.kind = kind;
+  modal.innerHTML = `<button class="modal-close" data-action="close-modal" aria-label="Close dialog">${icon('x')}</button>${content}`;
+  if (!modal.open) modal.showModal();
+}
+function closeModal() { audio.stop(); if (modal.open) modal.close(); activeEvent = null; modal.dataset.kind = ''; }
+modal.addEventListener('close', () => { if (!modal.open) { audio.stop(); activeEvent = null; } });
+function alertModal() {
+  if (!ble.isReady()) { toast('Reconnect before creating an alert from the phone.',true); return; }
+  showModal(`<p class="demo-label">PHONE ACTION · SIMULATED</p><h2 id="modal-title" class="modal-title">Send a phone alert?</h2><p class="modal-lead">This creates a phone-originated alert. To test a physical wearable button, use Demo controls. Contact delivery and replies are simulated separately.</p>${contactSummary()}<div class="modal-actions"><button class="button" data-action="close-modal">Cancel</button><button class="button danger" data-action="confirm-alert" ${!store.state.contacts.length ? 'disabled' : ''}>Create phone alert</button></div>`, 'phone-alert');
+}
+function demoOption(title, detail, control) { return `<div class="demo-option"><div><h3>${title}</h3><p>${detail}</p></div>${control}</div>`; }
+function demoModal() {
+  const s = store.state, t = s.device.telemetry;
+  const toggle = (action,label,checked) => `<button class="switch" role="switch" aria-label="${label}" aria-checked="${checked}" data-action="${action}"></button>`;
+  showModal(`<p class="demo-label">SIMULATOR · NOT LIVE DEVICE DATA</p><h2 id="modal-title" class="modal-title">Try the moments that matter.</h2><p class="modal-lead">Wearable actions can occur offline. Phone controls never create events on a disconnected wearable.</p>
+    <p class="queue-callout" data-simulator-summary></p>
+    <fieldset class="demo-group"><legend>Wearable & connection</legend>
+      ${demoOption('Bluetooth connection', '<span data-demo-connection>' + esc(s.device.connection) + '</span> · reconnect shows Connecting and Syncing.', toggle('demo-connection','Demo Bluetooth connection',s.device.connection !== 'disconnected'))}
+      ${demoOption('Wearable alarm button','Creates a hardware-side event even outside Bluetooth range.','<button class="button" data-action="simulate-alarm">Press button</button>')}
+      ${demoOption('Skin contact','Loss must be stable for 1.5 seconds before a removal alert.',toggle('demo-contact','Demo skin contact',t.rawWorn))}
+      ${demoOption('Brief contact loss','A 400ms interruption should create no removal alert.','<button class="button" data-action="brief-contact">Try brief loss</button>')}
+      ${demoOption('Low battery',`${t.battery}% simulated charge. Design target: &gt;12 hours.`,toggle('demo-battery','Demo low battery',t.battery <= 20))}
+      ${demoOption('USB-C charging','Charging does not fabricate a charge or runtime estimate.',toggle('demo-charging','Demo USB-C charging',t.charging))}
+    </fieldset>
+    <fieldset class="demo-group"><legend>Fall scenarios</legend>
+      ${demoOption('Possible fall','Repeated detections keep the original deadline.','<button class="button" data-action="simulate-fall">Trigger / repeat</button>')}
+      ${demoOption('Physical cancellation','A wearable-side cancellation works without the phone.','<button class="button" data-action="wearable-cancel-fall">Cancel on wearable</button>')}
+      ${demoOption('Interrupted session','Reload while preserving the original check-in deadline.','<button class="button" data-action="interrupt-fall">Save & reload</button>')}
+      <p class="small-description" data-fall-summary></p>
+    </fieldset>
+    <fieldset class="demo-group"><legend>Independent component faults</legend>
+      ${['motion','contact','audio','haptic'].map(name => demoOption(`${name[0].toUpperCase() + name.slice(1)} failure`, 'Tests this component independently of Bluetooth.', `<button class="switch" role="switch" aria-label="Demo ${name} failure" aria-checked="${t.components[name] === 'failed'}" data-action="component-failure" data-key="${name}"></button>`)).join('')}
+    </fieldset>
+    <fieldset class="demo-group"><legend>Delivery, replies & feedback</legend>
+      ${demoOption('Fail contact delivery','The phone receives the event, but contact delivery fails.',toggle('delivery-failure','Demo delivery failure',s.simulation.deliveryFailure))}
+      <label class="form-field">Reply from<select id="demo-responder">${s.contacts.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('')}</select></label>
+      <button class="button full" data-action="ack-latest">Acknowledge latest delivered event</button>
+      <p class="small-description section-gap">Open an acknowledged event in Alerts to confirm or fail its haptic command. Reconnecting alone never confirms completion.</p>
+      ${demoOption('Duplicate packet','Replay an existing ID; history must not gain a duplicate.','<button class="button" data-action="replay-event">Replay packet</button>')}
+    </fieldset>
+    <div class="modal-actions"><button class="button ghost" data-action="reset-demo">Reset demo data</button><button class="button primary" data-action="close-modal">Done</button></div>`, 'demo');
+  syncModal();
+}
+function eventDetails(event) {
+  const rows = [
+    ['Event detected',event.detectedAt, event.source === 'phone' ? 'Phone-originated alert' : 'Simulated wearable event'],
+    ['Received by phone',event.receivedAt,`Metadata: ${event.transfer.status}`],
+    ['Delivered to safety contacts',event.deliveredAt, event.delivery.reason || `Simulated delivery: ${event.delivery.status}`],
+    ['Safety contact acknowledged',event.acknowledgedAt,event.responder ? event.responder.name : 'Waiting for a selected contact to reply'],
+    ['Wearable feedback completed',event.haptic.confirmedAt,HAPTIC[event.haptic.status]]
+  ];
+  return statusPill(event) + `<ol class="timeline">${rows.map(([label,at,detail]) => `<li><span class="timeline-dot ${at === null ? 'waiting' : ''}"></span><div><strong>${label}</strong><p>${stamp(at)}<br>${esc(detail)}</p></div></li>`).join('')}</ol><div class="queue-callout">Haptic: ${esc(HAPTIC[event.haptic.status])}${event.haptic.reason ? ' · ' + esc(event.haptic.reason) : ''}<br>Command ID: <span class="event-id">${esc(event.haptic.commandId || 'Not requested')}</span> · Attempts: ${event.haptic.attempts}</div>`;
+}
+function eventModal(id) {
+  const event = alerts.visible().find(e => e.id === id); if (!event) return;
+  showModal(`<p class="demo-label">SIMULATED ${event.source.toUpperCase()} EVENT</p><h2 id="modal-title" class="modal-title">${TYPES[event.type]?.title || 'Alert'}</h2><p class="event-id">${esc(event.id)}</p><div data-event-details></div>
+    <div class="audio-block"><div class="audio-summary"><strong>Event audio</strong><span data-audio-status></span></div>${wave()}<div class="audio-controls"><button class="play-button" data-action="play-audio" aria-label="Play synthetic audio sample">${icon('play')}</button><input class="audio-range" id="audio-seek" aria-label="Seek in synthetic audio" type="range" min="0" max="40" step=".1" value="0"><span class="audio-time" id="audio-time">0:00 / 0:40</span></div><p class="playback-state" id="playback-state"></p></div><p class="audio-micro-note">20s before + 20s after. Download and playback use generated quiet tones, not microphone recordings.</p>
+    <label class="form-field">Simulate a reply from<select id="ack-contact">${event.recipients.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('')}</select></label>
+    <div class="event-actions"><button class="button primary" data-action="ack-event" data-id="${esc(id)}">Simulate acknowledgement</button><button class="button" data-action="retry-delivery" data-id="${esc(id)}">Retry delivery</button><button class="button" data-action="retry-haptic" data-id="${esc(id)}">Retry feedback</button><button class="button" data-action="confirm-haptic" data-id="${esc(id)}">Simulate wearable confirmation</button><button class="button" data-action="fail-haptic" data-id="${esc(id)}">Simulate motor failure</button><button class="button" data-action="download-audio">${icon('download')} Synthetic audio</button></div><div class="modal-actions"><button class="button" data-action="close-modal">Done</button></div>`, 'event');
+  activeEvent = id; syncModal();
+}
+function syncModal() {
+  if (!modal.open) return;
+  if (modal.dataset.kind === 'demo') {
+    modal.querySelector('[data-simulator-summary]').textContent = `Simulator only: ${alerts.queued().length} event(s) awaiting phone receipt. This physical queue is hidden from the disconnected phone UI.`;
+    modal.querySelector('[data-demo-connection]').textContent = store.state.device.connection;
+    const fall = store.state.fall;
+    const previousFall = store.state.fallHistory[0];
+    modal.querySelector('[data-fall-summary]').textContent = fall ? `Active: ${Math.max(0,Math.ceil((fall.dueAt - store.now())/1000))}s remaining · ${fall.repeats} repeat(s).` : previousFall ? `Last check-in: ${previousFall.outcome} · ${exactTime(previousFall.endedAt)} · ${previousFall.repeats} repeat(s).` : 'No active fall check-in.';
+    modal.querySelector('[data-action="wearable-cancel-fall"]').disabled = !fall;
+    modal.querySelector('[data-action="interrupt-fall"]').disabled = !fall;
+    return;
+  }
+  if (modal.dataset.kind !== 'event' || !activeEvent) return;
+  const event = alerts.get(activeEvent); if (!event) return;
+  const details = modal.querySelector('[data-event-details]');
+  const html = eventDetails(event); if (details.innerHTML !== html) details.innerHTML = html;
+  modal.querySelector('[data-audio-status]').textContent = audio.description(event);
+  const ready = event.audio.status === 'ready';
+  modal.querySelectorAll('[data-action="play-audio"],[data-action="download-audio"],#audio-seek').forEach(el => el.disabled = !ready);
+  modal.querySelector('[data-action="ack-event"]').disabled = event.delivery.status !== 'delivered' || event.acknowledgedAt !== null;
+  const recipientSelect = modal.querySelector('#ack-contact');
+  const recipientKey = JSON.stringify(event.recipients.map(c => [c.id,c.name]));
+  if (recipientSelect.dataset.recipients !== recipientKey) {
+    const selected = recipientSelect.value;
+    recipientSelect.innerHTML = event.recipients.map(c => `<option value="${esc(c.id)}">${esc(c.name)}</option>`).join('');
+    if (event.recipients.some(c => c.id === selected)) recipientSelect.value = selected;
+    recipientSelect.dataset.recipients = recipientKey;
+  }
+  if (event.responder && event.recipients.some(c => c.id === event.responder.id)) recipientSelect.value = event.responder.id;
+  recipientSelect.disabled = event.acknowledgedAt !== null || event.delivery.status !== 'delivered';
+  modal.querySelector('[data-action="retry-delivery"]').hidden = event.delivery.status !== 'failed';
+  modal.querySelector('[data-action="retry-haptic"]').hidden = event.haptic.status !== 'failed';
+  modal.querySelectorAll('[data-action="confirm-haptic"],[data-action="fail-haptic"]').forEach(el => { el.hidden = event.acknowledgedAt === null || event.haptic.status === 'successful'; el.disabled = event.haptic.status !== 'sent' || !ble.isReady(); });
+  const playing = audio.player && !audio.player.paused;
+  const button = modal.querySelector('[data-action="play-audio"]'); button.innerHTML = icon(playing ? 'pause' : 'play'); button.setAttribute('aria-label',playing ? 'Pause synthetic audio sample' : 'Play synthetic audio sample');
+  modal.querySelector('#playback-state').textContent = playing ? 'Playing synthetic tones. No real recording.' : audio.description(event);
+  if (audio.player) {
+    const seconds = audio.player.currentTime;
+    modal.querySelector('#audio-seek').value = seconds;
+    modal.querySelector('#audio-time').textContent = `${Math.floor(seconds/60)}:${String(Math.floor(seconds%60)).padStart(2,'0')} / 0:40`;
+  }
+}
+audio.onPlayback = syncModal;
+function contactModal(id) {
+  const c = store.state.contacts.find(c => c.id === id) || { id:'', name:'', role:'', phone:'', email:'' };
+  showModal(`<h2 id="modal-title" class="modal-title">${id ? 'Edit safety contact' : 'Add someone you trust'}</h2><form id="contact-form" data-id="${esc(c.id)}">${[['name','Full name','text'],['role','Relationship / role','text'],['phone','Phone number','tel'],['email','Email (optional)','email']].map(([key,label,type]) => `<label class="form-field">${label}<input name="${key}" type="${type}" maxlength="${key === 'email' ? 120 : 70}" ${key !== 'email' ? 'required' : ''} value="${esc(c[key])}"></label>`).join('')}<div class="modal-actions"><button class="button" type="button" data-action="close-modal">Cancel</button><button class="button primary" type="submit">Save contact</button></div></form>`, 'contact');
+}
+function deviceCheck() {
+  showModal(`<p class="demo-label">SIMULATED COMPONENT CHECK</p><h2 id="modal-title" class="modal-title">A moment to check in.</h2>${checkCards()}<p class="small-description section-gap">Each result uses its own simulated sensor state. Unknown is not a pass. This does not test hardware.</p><div class="modal-actions"><button class="button primary" data-action="close-modal">Done</button></div>`, 'check');
+}
+function refreshDemo() { const top = modal.scrollTop; demoModal(); modal.scrollTop = top; }
+function afterAction(message) { render(); syncModal(); if (message) toast(message); }
 
-document.addEventListener('click',event=>{
- const target=event.target.closest('[data-action],[data-view]');if(!target||target.disabled)return;
- if(target.dataset.view){event.preventDefault();navTo(target.dataset.view);return;}
- const action=target.dataset.action,id=target.dataset.id;event.preventDefault();
- switch(action){
-  case 'close-modal':closeModal();break;
-  case 'send-alert':alertModal();break;
-  case 'confirm-alert':case 'simulate-alarm':{const e=createEvent();closeModal();if(state.connected){navTo('alerts');toast('Demo alert received by phone. Waiting for a contact’s reply.');eventModal(e.id);}else toast('Demo event saved on the wearable. Reconnect to sync it.');break;}
-  case 'event':eventModal(id);break;
-  case 'filter':filter=target.dataset.key;render();break;
-  case 'demo-controls':demoModal();break;
-  case 'demo-connection':if(!state.connected){reconnect();demoModal();}else{state.connected=false;state.lastSync=Date.now();save();render();demoModal();if(state.settings.disconnectNotice)toast('Demo Bluetooth disconnected. Status is now last known.');}break;
-  case 'reconnect':reconnect();break;
-  case 'demo-contact':state.worn=!state.worn;if(!state.worn)createEvent('removal');save();render();demoModal();if(!state.worn&&state.settings.contactNotice)toast(state.connected?'Skin contact lost. Demo removal alert created.':'Demo wearable removed. Event will sync after reconnection.');break;
-  case 'demo-battery':state.battery=state.battery<=20?84:14;save();render();demoModal();break;
-  case 'demo-charging':state.charging=!state.charging;save();render();demoModal();break;
-  case 'simulate-fall':state.fallDue=Date.now()+10000;save();closeModal();render();toast('Possible demo fall. You have 10 seconds to tap “I’m okay.”');break;
-  case 'cancel-fall':state.fallDue=null;save();render();toast('Fall check-in cancelled. No alert was created.');break;
-  case 'ack-latest':{const latest=state.events.find(e=>e.status==='awaiting');if(latest)acknowledge(latest.id);break;}
-  case 'ack-event':acknowledge(id);break;
-  case 'device-check':deviceCheck();break;
-  case 'haptic-test':hapticTest();break;
-  case 'pairing-info':showModal(`<p class="demo-label">DEMO CONNECTION</p><h2 id="modal-title" class="modal-title">Paired and in sync.</h2><p class="modal-lead">CCEW-024 is the simulated wearable for this prototype. Use Demo controls to disconnect, create events out of range, and reconnect.</p><div class="queue-callout">This is a connection preview for design review. Pairing a real wearable will be added when the app is connected to the team’s hardware.</div><div class="modal-actions"><button class="button primary" data-action="close-modal">Done</button></div>`);break;
-  case 'add-contact':contactModal();break;
-  case 'edit-contact':contactModal(id);break;
-  case 'delete-contact':{const c=state.contacts.find(x=>x.id===id);if(c)showModal(`<h2 id="modal-title" class="modal-title">Remove ${esc(c.name)}?</h2><p class="modal-lead">This removes the contact from this browser’s demo safety circle. Existing event history stays available.</p><div class="modal-actions"><button class="button" data-action="close-modal">Keep contact</button><button class="button danger" data-action="confirm-delete" data-id="${esc(id)}">Remove contact</button></div>`);break;}
-  case 'confirm-delete':state.contacts=state.contacts.filter(c=>c.id!==id);save();closeModal();render();toast('Contact removed from this demo.');break;
-  case 'go-contacts':closeModal();navTo('contacts');contactModal();break;
-  case 'setting-toggle':{const key=target.dataset.key;if(!['disconnectNotice','contactNotice','reducedMotion'].includes(key))return;state.settings[key]=!state.settings[key];save();render();toast('Preference saved in this browser.');break;}
-  case 'reset-demo':showModal(`<p class="demo-label">RESET PROTOTYPE</p><h2 id="modal-title" class="modal-title">Start with a clean slate?</h2><p class="modal-lead">Your locally added contacts, profile edits, and demo events will be replaced with the original sample data.</p><div class="modal-actions"><button class="button" data-action="demo-controls">Keep my changes</button><button class="button danger" data-action="confirm-reset">Reset demo</button></div>`);break;
-  case 'confirm-reset':state=freshState();filter='all';save();closeModal();render();toast('Demo data reset.');break;
-  case 'play-audio':playAudio();break;
-  case 'download-audio':{const a=document.createElement('a');a.href=makeSampleURL();a.download='CCEW-synthetic-demo-audio-40s.wav';document.body.append(a);a.click();a.remove();toast('Downloaded a synthetic sample. It contains no real recording.');break;}
- }
+document.addEventListener('click', async event => {
+  const target = event.target.closest('[data-action],[data-view]'); if (!target || target.disabled) return;
+  event.preventDefault();
+  if (target.dataset.view) { navTo(target.dataset.view); return; }
+  const { action, id, key } = target.dataset;
+  switch (action) {
+    case 'close-modal': closeModal(); break;
+    case 'send-alert': alertModal(); break;
+    case 'confirm-alert': {
+      const created = alerts.requestFromPhone();
+      if (!created) { closeModal(); afterAction('Connection changed. No phone alert was created.'); break; }
+      navTo('alerts'); eventModal(created.id); afterAction('Phone alert received locally. Contact delivery is pending.'); break;
+    }
+    case 'event': eventModal(id); break;
+    case 'demo-controls': demoModal(); break;
+    case 'demo-connection':
+      if (store.state.device.connection === 'disconnected') ble.connect(); else ble.disconnect();
+      render(); refreshDemo(); if (store.state.settings.disconnectNotice) toast('Simulated connection: ' + store.state.device.connection); break;
+    case 'reconnect': ble.connect(); afterAction(); break;
+    case 'simulate-alarm': demo.pressButton(); render(); syncModal(); toast('Simulator: physical button event stored. Phone receipt is a separate step.'); break;
+    case 'demo-contact': demo.setContact(!store.state.device.telemetry.rawWorn); render(); refreshDemo(); break;
+    case 'brief-contact': demo.briefContactLoss(); render(); syncModal(); toast('Simulator: 400ms contact interruption.'); break;
+    case 'demo-battery': demo.setBattery(store.state.device.telemetry.battery <= 20 ? 84 : 14); render(); refreshDemo(); break;
+    case 'demo-charging': device.updateTelemetry({ charging: !store.state.device.telemetry.charging }); render(); refreshDemo(); break;
+    case 'component-failure': demo.setComponent(key, store.state.device.telemetry.components[key] === 'ok' ? 'failed' : 'ok'); render(); refreshDemo(); break;
+    case 'delivery-failure': store.state.simulation.deliveryFailure = !store.state.simulation.deliveryFailure; store.save(); refreshDemo(); break;
+    case 'simulate-fall': {
+      const fall = demo.startFall(); if (!fall) { toast('Simulator: motion sensor is failed.',true); break; }
+      closeModal(); afterAction(fall.repeats ? 'Repeated detection recorded. The original deadline is unchanged.' : 'Simulator: possible fall check-in started.'); break;
+    }
+    case 'cancel-fall': if (demo.cancelFall()) afterAction('Fall check-in cancelled. No alert created.'); else toast('Reconnect to cancel from the phone.',true); break;
+    case 'wearable-cancel-fall': demo.cancelFall({ fromPhone:false }); render(); syncModal(); break;
+    case 'interrupt-fall': demo.interruptSession(); location.reload(); break;
+    case 'ack-event': {
+      const contactId = modal.querySelector('#ack-contact')?.value;
+      if (alerts.acknowledge(id,contactId)) { haptics.tick(); afterAction('Reply received. Wrist feedback still needs wearable confirmation.'); }
+      break;
+    }
+    case 'ack-latest': {
+      const latest = alerts.visible().find(e => e.deliveredAt !== null && e.acknowledgedAt === null);
+      const selected = modal.querySelector('#demo-responder').value;
+      if (latest && alerts.acknowledge(latest.id,selected)) { haptics.tick(); render(); syncModal(); toast('Selected contact replied. Haptic completion is unconfirmed.'); }
+      else toast('No delivered event can be acknowledged by that contact. Open an event to see its recipients.',true);
+      break;
+    }
+    case 'retry-delivery': alerts.retryDelivery(id); afterAction(); break;
+    case 'retry-haptic': haptics.retry(id); haptics.tick(); afterAction(); break;
+    case 'confirm-haptic': case 'fail-haptic': demo.confirmHaptic(id,action === 'confirm-haptic'); afterAction(); break;
+    case 'replay-event': {
+      const latest = store.state.events[0]; if (latest) alerts.detect(latest.type,{ id:latest.id, detectedAt:latest.detectedAt });
+      toast('Existing event ID replayed; no duplicate created.'); syncModal(); break;
+    }
+    case 'device-check': deviceCheck(); break;
+    case 'haptic-test': showModal(`<h2 id="modal-title" class="modal-title">A visual pattern preview</h2><p class="modal-lead">${esc(store.state.settings.hapticPattern)}. This preview does not send a command or mark feedback completed.</p><div class="pattern-preview" aria-hidden="true">${store.state.settings.hapticPattern === 'Two short pulses' ? '━━　━━' : '━━━━━━━━'}</div><div class="modal-actions"><button class="button" data-action="close-modal">Done</button></div>`); break;
+    case 'add-contact': contactModal(); break;
+    case 'edit-contact': contactModal(id); break;
+    case 'primary-contact': {
+      const index = store.state.contacts.findIndex(c => c.id === id);
+      if (index > 0) store.state.contacts.unshift(...store.state.contacts.splice(index,1));
+      store.save(); afterAction('Primary contact updated.'); break;
+    }
+    case 'move-contact': {
+      const contacts = store.state.contacts, from = contacts.findIndex(c => c.id === id), to = from + Number(target.dataset.direction);
+      if (from > 0 && to > 0 && to < contacts.length) [contacts[from],contacts[to]] = [contacts[to],contacts[from]];
+      store.save(); afterAction(); break;
+    }
+    case 'delete-contact': {
+      const contact = store.state.contacts.find(c => c.id === id); if (!contact) break;
+      const next = store.state.contacts[1];
+      showModal(`<h2 id="modal-title" class="modal-title">Remove ${esc(contact.name)}?</h2><p class="modal-lead">This removes the contact from future deliveries. Existing recipient and reply records stay intact.${store.state.contacts[0].id === id && next ? ` ${esc(next.name)} becomes primary.` : ''}</p><label class="confirm-check"><input type="checkbox" id="delete-confirm"> I want to remove this safety contact.</label><div class="modal-actions"><button class="button" data-action="close-modal">Keep contact</button><button class="button danger" data-action="confirm-delete" data-id="${esc(id)}" disabled>Remove contact</button></div>`, 'delete'); break;
+    }
+    case 'confirm-delete':
+      if (!modal.querySelector('#delete-confirm')?.checked) break;
+      store.state.contacts = store.state.contacts.filter(c => c.id !== id); store.save(); closeModal(); afterAction('Contact removed from future simulated deliveries.'); break;
+    case 'setting-toggle':
+      if (!['disconnectNotice','contactNotice','reducedMotion'].includes(key)) break;
+      store.state.settings[key] = !store.state.settings[key]; store.save(); afterAction(); break;
+    case 'reset-demo': showModal(`<h2 id="modal-title" class="modal-title">Reset demo data?</h2><p class="modal-lead">This replaces saved profile edits, contacts, events, and pending simulator work with sample data.</p><div class="modal-actions"><button class="button" data-action="close-modal">Keep changes</button><button class="button danger" data-action="confirm-reset">Reset demo</button></div>`); break;
+    case 'confirm-reset': audio.stop(); store.reset(); statusFilter = typeFilter = 'all'; closeModal(); afterAction('Demo data reset.'); break;
+    case 'play-audio': {
+      const e = alerts.get(activeEvent); if (!e) break;
+      try { await audio.play(e); syncModal(); } catch { toast('The browser could not play the synthetic sample.',true); }
+      break;
+    }
+    case 'download-audio': {
+      const e = alerts.get(activeEvent); if (e?.audio.status !== 'ready') break;
+      const link = document.createElement('a'); link.href = audio.makeSampleURL(); link.download = 'CCEW-synthetic-demo-audio-40s.wav'; link.click(); break;
+    }
+  }
 });
-document.addEventListener('submit',event=>{
- if(event.target.id==='profile-form'){event.preventDefault();const data=new FormData(event.target);const name=String(data.get('name')).trim(),role=String(data.get('role')).trim();if(!name||!role){toast('Enter a name and role.',true);return;}state.profile={name,role,organization:String(data.get('organization')).trim()};save();render();toast('Profile saved in this browser.');}
- if(event.target.id==='contact-form'){event.preventDefault();const data=new FormData(event.target),oldId=event.target.dataset.id;const c={id:oldId||`contact-${Date.now()}`,name:String(data.get('name')).trim(),role:String(data.get('role')).trim(),phone:String(data.get('phone')).trim(),email:String(data.get('email')).trim()};if(!c.name||!c.role||c.phone.replace(/\D/g,'').length<7){toast('Enter a name, role, and valid phone number.',true);return;}if(oldId)state.contacts=state.contacts.map(x=>x.id===oldId?c:x);else state.contacts.push(c);save();closeModal();render();toast('Safety contact saved in this browser.');}
+document.addEventListener('submit', event => {
+  if (!['profile-form','contact-form'].includes(event.target.id)) return;
+  event.preventDefault(); const data = new FormData(event.target);
+  const value = name => String(data.get(name) || '').trim();
+  if (event.target.id === 'profile-form') {
+    if (!value('name') || !value('role')) return;
+    store.state.profile = { name:value('name'), role:value('role'), organization:value('organization') }; store.save(); afterAction('Profile saved in this browser.');
+  } else {
+    if (!value('name') || !value('role') || value('phone').replace(/\D/g,'').length < 7) { toast('Enter a name, role, and a phone number with at least seven digits.',true); return; }
+    const oldId = event.target.dataset.id;
+    const contact = { id:oldId || store.id('contact'), name:value('name'), role:value('role'), phone:value('phone'), email:value('email') };
+    if (oldId) store.state.contacts = store.state.contacts.map(c => c.id === oldId ? contact : c); else store.state.contacts.push(contact);
+    store.save(); closeModal(); afterAction('Safety contact saved.');
+  }
 });
-document.addEventListener('change',event=>{if(event.target.id==='haptic-pattern'){state.settings.hapticPattern=event.target.value;save();toast('Demo haptic pattern saved.');}});
-document.addEventListener('input',event=>{if(event.target.id==='audio-seek'){const n=Number(event.target.value);if(playingAudio)playingAudio.currentTime=n;const label=document.querySelector('#audio-time');if(label)label.textContent=`${formatDuration(n)} / 0:40`;}});
-document.addEventListener('keydown',event=>{if(event.key.toLowerCase()==='d'&&!event.ctrlKey&&!event.metaKey&&!event.altKey&&!['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName)&&!modal.open){event.preventDefault();demoModal();}});
-setInterval(()=>{
- let audioChanged=false;for(const e of state.events)if(state.connected&&Date.now()>=e.audioReadyAt&&!e.audioSynced){e.audioSynced=true;audioChanged=true;}if(audioChanged)save();
- if(state.fallDue){const left=Math.ceil((state.fallDue-Date.now())/1000);if(left<=0){state.fallDue=null;const e=createEvent('fall');save();render();toast(state.connected?'Demo fall alert received. Waiting for a contact’s reply.':'Demo fall event saved on wearable until reconnection.');}else document.querySelectorAll('[data-fall-count]').forEach(el=>el.textContent=left);}
- syncActiveAudio();
-},250);
-window.addEventListener('beforeunload',()=>{stopPlayback();if(audioURL)URL.revokeObjectURL(audioURL);});
-hydrateIcons();render();
+document.addEventListener('change', event => {
+  switch (event.target.id) {
+    case 'status-filter': statusFilter = event.target.value; render(); break;
+    case 'type-filter': typeFilter = event.target.value; render(); break;
+    case 'haptic-pattern': store.state.settings.hapticPattern = event.target.value; store.save(); break;
+    case 'delete-confirm': modal.querySelector('[data-action="confirm-delete"]').disabled = !event.target.checked; break;
+  }
+});
+document.addEventListener('input', event => {
+  if (event.target.id === 'audio-seek' && audio.player) { audio.player.currentTime = Number(event.target.value); syncModal(); }
+});
+document.addEventListener('keydown', event => {
+  if (event.key.toLowerCase() === 'd' && !event.ctrlKey && !event.metaKey && !event.altKey && !['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName) && !modal.open) { event.preventDefault(); demoModal(); }
+});
+function tick() {
+  const before = store.revision;
+  const previousDevice = device.getStatus();
+  ble.tick(); demo.tick(); alerts.tick(); audio.tick(); haptics.tick();
+  if (store.revision !== before) needsRender = true;
+  const nextLabel = greeting() + new Date().toDateString();
+  if (clockLabel !== nextLabel) { clockLabel = nextLabel; needsRender = true; }
+  const nextDevice = device.getStatus();
+  if (previousDevice.current && previousDevice.worn && nextDevice.current && !nextDevice.worn && store.state.settings.contactNotice) toast('Skin contact lost after a stable reading. A simulated removal event was recorded.');
+  // Preserve text inputs and native selects during background simulator updates.
+  const editing = document.querySelector('#main').contains(document.activeElement) && ['INPUT','TEXTAREA','SELECT'].includes(document.activeElement.tagName);
+  if (needsRender && !editing) render();
+  document.querySelectorAll('[data-fall-count]').forEach(el => { const fall = device.visibleFall(); if (fall) el.textContent = Math.max(0,Math.ceil((fall.dueAt-store.now())/1000)); });
+  syncModal();
+}
+app.render = render; app.navTo = navTo; app.tick = tick; app.greeting = greeting;
+setInterval(tick,250);
+window.addEventListener('beforeunload', () => audio.dispose());
+hydrateIcons(); tick(); render();
+if (store.storageFailed || !browserStorage) toast('Browser storage is unavailable. Changes last for this session only.',true);
