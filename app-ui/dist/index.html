@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#183c39">
+  <meta name="description" content="CCEW Companion wearable alert app — interactive capstone UI prototype.">
+  <title>CCEW Companion</title>
+  <link rel="icon" type="image/svg+xml" href="./assets/mark.svg">
+  <link rel="stylesheet" href="./styles.css">
+  <script defer src="./app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Main navigation">
+      <a class="brand" href="#overview" aria-label="CCEW Companion overview"><span class="brand-mark" data-icon="shield"></span><span>CCEW<span class="brand-sub">COMPANION</span></span></a>
+      <div class="nav-caption">YOUR EVERYDAY SUPPORT</div>
+      <nav id="desktop-nav"></nav>
+      <div class="sidebar-bottom">
+        <div class="connection-mini" id="sidebar-connection"></div>
+        <button class="demo-button" data-action="demo-controls"><span data-icon="sliders"></span><span>Demo controls</span><span class="keycap">D</span></button>
+        <p class="prototype-note"><span class="small-dot"></span> UI prototype · simulated data</p>
+      </div>
+    </aside>
+    <div class="workspace">
+      <header class="mobile-brand"><a class="brand" href="#overview"><span class="brand-mark" data-icon="shield"></span><span>CCEW<span class="brand-sub">COMPANION</span></span></a><span class="demo-pill">DEMO</span><button class="icon-button" data-action="demo-controls" aria-label="Open demo controls"><span data-icon="sliders"></span></button></header>
+      <main id="main" tabindex="-1"></main>
+      <footer class="app-footer"><span>CCEW Companion</span><span>Designed for the people who show up.</span><span>Capstone prototype</span></footer>
+    </div>
+    <nav class="mobile-nav" id="mobile-nav" aria-label="Mobile navigation"></nav>
+  </div>
+  <dialog id="modal" aria-labelledby="modal-title"></dialog>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <div id="live-updates" class="sr-only" role="status" aria-live="polite"></div>
+</body>
+</html>
